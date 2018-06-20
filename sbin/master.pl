@@ -24,6 +24,7 @@ use warnings;
 use FindBin qw|$Bin|;
 use lib "$Bin/../lib";
 use Pg::Failover::Config;
+use Pg::Failover::Log;
 
 $SIG{'INT'}     = 'INT_handler';
 $ENV{ITG_ROOT}  = "$Bin/../";
@@ -31,20 +32,27 @@ my $interval    = 1;
 my $loop        = 1;
 my $output;
 my $conf = Pg::Failover::Config->new();
+my $log  = Pg::Failover::Log->new();
 
 #-------------------------------------------------------------------------------
 #  Initial check
 #-------------------------------------------------------------------------------
 my $nodeconf = $conf->get_config('node');
+my $dbconf  = $conf->get_config('db');
+my $netconf = $conf->get_config('network');
 die "Exiting, not a primary node\n" unless $$nodeconf{role} eq 'primary';
+die "db configuration not complete\n" unless $conf->validate_db_config($dbconf);
+die "network configuration not complete\n" unless $conf->validate_network_config($netconf);
+
+#-------------------------------------------------------------------------------
+#  Start Virtual IP
+#-------------------------------------------------------------------------------
+die "Starting Virtual IP failed\n" unless start_vip();
 
 #-------------------------------------------------------------------------------
 #  handle query DB
 #-------------------------------------------------------------------------------
-my $db_threshold = 10;
 my @db_container;
-my $dbconf = $conf->get_config('db');
-die "db configuration not complete\n" unless $conf->validate_db_config($dbconf);
 
 open my $query, "$ENV{ITG_ROOT}/bin/select_query.pl |" or die "$!\n";
 
@@ -52,8 +60,6 @@ open my $query, "$ENV{ITG_ROOT}/bin/select_query.pl |" or die "$!\n";
 #  handle dns ping
 #-------------------------------------------------------------------------------
 my @dns_container;
-my $netconf = $conf->get_config('network');
-die "network configuration not complete\n" unless $conf->validate_network_config($netconf);
 
 #die "dns_ip must be configured\n" unless exists $$netconf{dns_ip};
 #die "dns_timeout must be configured\n" unless exists $$netconf{dns_timeout};
@@ -69,6 +75,7 @@ my @gw_container;
 
 open my $gw_ping, ping_command($$netconf{gw_ip}) . '|' or die "$!\n";
 
+LOOP:
 while ($loop == 1)
 {
     #-------------------------------------------------------------------------------
@@ -77,11 +84,12 @@ while ($loop == 1)
     $output = <$query>;
     unless (query_valid($output))
     {
-        check_db_threshold();
+        check_db_timeout();
     }   
     else
     {
-        print "query db ok\n";
+        $log->info("query db ok");
+        reset_db_container();
     }
 
     #-------------------------------------------------------------------------------
@@ -96,7 +104,8 @@ while ($loop == 1)
         }
         else
         {
-            print "ping DNS ok\n";
+            $log->info("ping DNS ok");
+            reset_dns_container();
         }
     }
 
@@ -112,7 +121,8 @@ while ($loop == 1)
         }
         else
         {
-            print "ping Gateway ok\n";
+            $log->info("ping Gateway ok");
+            reset_gw_container();
         }
     }
 
@@ -155,19 +165,16 @@ sub check_gw_timeout
     {
         stop_db_services();
         $loop = 0;
+        last;
     }
     elsif ($#gw_container == -1)
     {
-        print "first adding failed gw query\n";
+        $log->info("first adding failed gw query");
         push @gw_container, time;
-    }
-    elsif ((time - $gw_container[0]) > $$netconf{gw_timeout})
-    {
-        reset_gw_container();
     }
     else
     {
-        print "adding failed gw ping\n";
+        $log->info("adding failed gw ping");
         push @gw_container, time;
     }
 }
@@ -178,64 +185,67 @@ sub check_dns_timeout
     {
         stop_db_services();
         $loop = 0;
+        last;
     }
     elsif ($#dns_container == -1)
     {
-        print "first adding failed dns query\n";
+        $log->info("first adding failed dns query");
         push @dns_container, time;
-    }
-    elsif ((time - $dns_container[0]) > $$netconf{dns_timeout})
-    {
-        reset_dns_container();
     }
     else
     {
-        print "adding failed dns ping\n";
+        $log->info("adding failed dns ping");
         push @dns_container, time;
     }
 }
 
-sub check_db_threshold
+sub check_db_timeout
 {
-    if ($#db_container == $db_threshold - 1)
+    if ($#db_container == $$dbconf{query_timeout} - 1)
     {
         stop_db_services();
         $loop = 0;
+        last;
     }
     elsif ($#db_container == -1)
     {
-        print "first adding failed query\n";
+        $log->info("first adding failed query");
         push @db_container, time;
-    }
-    elsif ((time - $db_container[0]) > $db_threshold)
-    {
-        reset_db_container();
     }
     else
     {
-        print "adding failed query\n";
+        $log->info("adding failed query");
         push @db_container, time;
     }
 }
 
 sub stop_db_services
 {
-    print "removing vip\n";
+    cleanup();
+
+    $log->info("removing vip");
     if (remove_vip())
     {
-        print "vip removed\n";
+        $log->info("vip removed");
     }
     else
     {
-        print "Failed to remove virtual IP\n";
+        $log->info("Failed to remove virtual IP");
     }
 
-    print "stop db failed\n" unless stop_db();
+    return stop_db();
 }
 
 sub stop_db
 {
     my $cmd = `$ENV{ITG_ROOT}/bin/stop_db.sh`;
+    return 1 if $? == 0;
+    return 0;
+}
+
+sub start_vip
+{
+    my $cmd = `$ENV{ITG_ROOT}/bin/start_vip.sh`;
     return 1 if $? == 0;
     return 0;
 }
@@ -249,19 +259,19 @@ sub remove_vip
 
 sub reset_db_container
 {
-    print "reseting db container\n";
+    $log->info("reseting db container");
     @db_container = ();
 }
 
 sub reset_dns_container
 {
-    print "reseting dns container\n";
+    $log->info("reseting dns container");
     @dns_container = ();
 }
 
 sub reset_gw_container
 {
-    print "reseting gw container\n";
+    $log->info("reseting gw container");
     @gw_container = ();
 }
 
@@ -282,7 +292,7 @@ sub cleanup
 
 sub INT_handler
 {
-    print "Interupted ...\n";
+    $log->info("Interupted ...");
     cleanup();
     exit 0;
 }
