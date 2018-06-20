@@ -1,0 +1,14 @@
+
+Config file: etc/network.conf
+
+options:
+- dns_check (Required => 1 to enable, 0 to disable)
+    If disabled, dns check will be skip, options will be ignored.
+    If enabled, other options must be set with value.
+
+- dns_ip (Required if dns_check enabled)
+- dns_timeout (Required if dns_check enabled)
+    this is based on ping, only counted if timeout is in a row
+- dns_threshold (Required if dns_check enabled)
+    if exceed, dns status will be set as failed.
+
