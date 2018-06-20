@@ -5,7 +5,7 @@
 #
 #        USAGE: ./secondary.pl  
 #
-#  DESCRIPTION: main secondary node program
+#  DESCRIPTION: main secondary program
 #
 #      OPTIONS: ---
 # REQUIREMENTS: ---
@@ -24,6 +24,7 @@ use warnings;
 use FindBin qw|$Bin|;
 use lib "$Bin/../lib";
 use Pg::Failover::Config;
+use Pg::Failover::Log;
 
 $SIG{'INT'}     = 'INT_handler';
 $ENV{ITG_ROOT}  = "$Bin/../";
@@ -31,41 +32,26 @@ my $interval    = 1;
 my $loop        = 1;
 my $output;
 my $conf = Pg::Failover::Config->new();
+my $log  = Pg::Failover::Log->new();
 
 #-------------------------------------------------------------------------------
 #  Initial check
 #-------------------------------------------------------------------------------
 my $nodeconf = $conf->get_config('node');
+my $dbconf  = $conf->get_config('db');
+my $netconf = $conf->get_config('network');
 die "Exiting, not a secondary node\n" unless $$nodeconf{role} eq 'secondary';
+die "db configuration not complete\n" unless $conf->validate_db_config($dbconf);
+die "network configuration not complete\n" unless $conf->validate_network_config($netconf);
 
 #-------------------------------------------------------------------------------
 #  handle query DB
 #-------------------------------------------------------------------------------
-my $db_threshold = 10;
 my @db_container;
-my $dbconf = $conf->get_config('db');
-die "db configuration not complete\n" unless $conf->validate_db_config($dbconf);
 
 open my $query, "$ENV{ITG_ROOT}/bin/select_query.pl |" or die "$!\n";
 
-#-------------------------------------------------------------------------------
-#  handle dns ping
-#-------------------------------------------------------------------------------
-my @dns_container;
-my $netconf = $conf->get_config('network');
-die "network configuration not complete\n" unless $conf->validate_network_config($netconf);
-
-open my $dns_ping, ping_command($$netconf{dns_ip}) . '|' or die "$!\n";
-
-#-------------------------------------------------------------------------------
-#  handle gw ping
-#-------------------------------------------------------------------------------
-my @gw_container;
-die "gw_ip must be configured\n" unless exists $$netconf{gw_ip};
-die "gw_timeout must be configured\n" unless exists $$netconf{gw_timeout};
-
-open my $gw_ping, ping_command($$netconf{gw_ip}) . '|' or die "$!\n";
-
+LOOP:
 while ($loop == 1)
 {
     #-------------------------------------------------------------------------------
@@ -74,43 +60,12 @@ while ($loop == 1)
     $output = <$query>;
     unless (query_valid($output))
     {
-        check_db_threshold();
+        check_db_timeout();
     }   
     else
     {
-        print "query db ok\n";
-    }
-
-    #-------------------------------------------------------------------------------
-    #  DNS Ping
-    #-------------------------------------------------------------------------------
-    $output = <$dns_ping>;
-    unless ($output =~ /^PING/)
-    {
-        unless (ping_valid($output))
-        {
-            check_dns_timeout();
-        }
-        else
-        {
-            print "ping DNS ok\n";
-        }
-    }
-
-    #-------------------------------------------------------------------------------
-    #  Gateway Ping
-    #-------------------------------------------------------------------------------
-    $output = <$gw_ping>;
-    unless ($output =~ /^PING/)
-    {
-        unless (ping_valid($output))
-        {
-            check_gw_timeout();
-        }
-        else
-        {
-            print "ping Gateway ok\n";
-        }
+        $log->info("query db ok");
+        reset_db_container();
     }
 
     sleep $interval;
@@ -124,6 +79,26 @@ sub ping_valid
 
     return 1 if $line =~ /^(\d+ bytes from)/;
     return 0;
+}
+
+sub ping_command_once
+{
+    my $ip = shift;
+
+    die "ip not defined\n" unless $ip;
+
+    if ($^O =~ /(linux|darwin)/)
+    {
+        return "ping -c 1 $ip";
+    }
+    elsif ($^O eq 'solaris')
+    {
+        return "ping -s $ip 64 1";
+    }
+    else
+    {
+        die "unsupported platform: $^O\n";
+    }
 }
 
 sub ping_command
@@ -146,93 +121,107 @@ sub ping_command
     }
 }
 
-sub check_gw_timeout
+sub check_db_timeout
 {
-    if ($#gw_container == $$netconf{gw_timeout} - 1)
+    if ($#db_container == $$dbconf{query_timeout} - 1)
     {
-        stop_db_services();
-        $loop = 0;
-    }
-    elsif ($#gw_container == -1)
-    {
-        print "first adding failed gw query\n";
-        push @gw_container, time;
-    }
-    elsif ((time - $gw_container[0]) > $$netconf{gw_timeout})
-    {
-        reset_gw_container();
-    }
-    else
-    {
-        print "adding failed gw ping\n";
-        push @gw_container, time;
-    }
-}
+        if (check_ping())
+        {
+            cleanup();
 
-sub check_dns_timeout
-{
-    if ($#dns_container == $$netconf{dns_timeout} - 1)
-    {
-        stop_db_services();
-        $loop = 0;
-    }
-    elsif ($#dns_container == -1)
-    {
-        print "first adding failed dns query\n";
-        push @dns_container, time;
-    }
-    elsif ((time - $dns_container[0]) > $$netconf{dns_timeout})
-    {
-        reset_dns_container();
-    }
-    else
-    {
-        print "adding failed dns ping\n";
-        push @dns_container, time;
-    }
-}
-
-sub check_db_threshold
-{
-    if ($#db_container == $db_threshold - 1)
-    {
-        stop_db_services();
-        $loop = 0;
+            if(promote_to_primary())
+            {
+                $loop = 0;
+                last;
+            }
+            else
+            {
+                $log->info("failed promote to primary");
+                reset_db_container();
+            }
+        }
+        else
+        {
+            reset_db_container();
+        }
     }
     elsif ($#db_container == -1)
     {
-        print "first adding failed query\n";
+        $log->info("first adding failed query");
         push @db_container, time;
-    }
-    elsif ((time - $db_container[0]) > $db_threshold)
-    {
-        reset_db_container();
     }
     else
     {
-        print "adding failed query\n";
+        $log->info("adding failed query");
         push @db_container, time;
     }
+}
+
+sub check_ping
+{
+    my $cmd = ping_command_once($$netconf{vip});
+    `$cmd`;
+    if ($? == 0)
+    {
+        $log->info('cancel promote, vip is pingable');
+        return 0;
+    }
+
+    my $stat = 0; # if ping dns and gw ok, return true
+    $cmd = ping_command_once($$netconf{dns_ip});
+    `$cmd`;
+    if ($? == 0)
+    {
+        $log->info('ping dns ok');
+        $stat += 1;
+    }
+
+    $cmd = ping_command_once($$netconf{gw_ip});
+    `$cmd`;
+    if ($? == 0)
+    {
+        $log->info('ping gw ok');
+        $stat += 1;
+    }
+
+    return 1 if $stat == 2;
+    return 0;
 }
 
 sub stop_db_services
 {
-    print "removing vip\n";
+    cleanup();
+
+    $log->info("removing vip");
     if (remove_vip())
     {
-        print "vip removed\n";
+        $log->info("vip removed");
     }
     else
     {
-        print "Failed to remove virtual IP\n";
+        $log->info("Failed to remove virtual IP");
     }
 
-    print "stop db failed\n" unless stop_db();
+    return stop_db();
+}
+
+sub promote_to_primary
+{
+    my $cmd = `$ENV{ITG_ROOT}/bin/promote.sh`;
+    return 1 if $? == 0;
+    return 0;
 }
 
 sub stop_db
 {
     my $cmd = `$ENV{ITG_ROOT}/bin/stop_db.sh`;
+    return 1 if $? == 0;
+    return 0;
+}
+
+sub start_vip
+{
+    my $cmd = `$ENV{ITG_ROOT}/bin/start_vip.sh`;
     return 1 if $? == 0;
     return 0;
 }
@@ -246,20 +235,8 @@ sub remove_vip
 
 sub reset_db_container
 {
-    print "reseting db container\n";
+    $log->info("reseting db container");
     @db_container = ();
-}
-
-sub reset_dns_container
-{
-    print "reseting dns container\n";
-    @dns_container = ();
-}
-
-sub reset_gw_container
-{
-    print "reseting gw container\n";
-    @gw_container = ();
 }
 
 sub query_valid
@@ -273,13 +250,11 @@ sub query_valid
 sub cleanup
 {
     close $query;
-    close $dns_ping;
-    close $gw_ping;
 }
 
 sub INT_handler
 {
-    print "Interupted ...\n";
+    $log->info("Interupted ...");
     cleanup();
     exit 0;
 }
