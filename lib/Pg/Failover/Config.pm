@@ -57,6 +57,7 @@ sub validate_db_config
     return 0 unless defined $$conf{dbuser};
     return 0 unless defined $$conf{dbname};
     return 0 unless defined $$conf{query};
+    return 0 unless defined $$conf{query_timeout};
     return 1;
 }
 
