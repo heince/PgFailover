@@ -34,7 +34,7 @@ my $dbport   = $$dbconf{dbport} // 5432;
 
 while (1)
 {
-    my $query = `psql -U $$dbconf{dbuser} -d $$dbconf{dbname} -h $$netconf{vip} -p $dbport -c "$$dbconf{query}"`;
+    my $query = `psql "connect_timeout=1" -U $$dbconf{dbuser} -d $$dbconf{dbname} -h $$netconf{vip} -p $dbport -c "$$dbconf{query}"`;
     if ($? == 0)
     {
         print "ok\n";
