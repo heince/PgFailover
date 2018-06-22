@@ -30,7 +30,7 @@ my $interval = 1;
 my $conf     = Pg::Failover::Config->new();
 my $dbconf   = $conf->get_config('db');
 my $netconf  = $conf->get_config('network');
-my $dbport   = $$dbconf{dbport} // 5432;
+my $dbport   = defined $$dbconf{dbport} ? $$dbconf{dbport} : 5432;
 
 while (1)
 {
