@@ -96,6 +96,14 @@ sub parse
     return \%result;
 }
 
+sub get_psql
+{
+    my ($self, $conf) = shift;
+
+    my $psql = defined $$conf{psql_path} ? $$conf{psql_path} : 'psql';
+    return $psql;
+}
+
 sub print_config
 {
     my $self = shift;
