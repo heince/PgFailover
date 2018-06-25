@@ -34,9 +34,10 @@ ok(-f "$ENV{ITG_ROOT}/etc/db.conf");
 print "# Testing if option 'query' exist and has a value\n";
 my $conf    = Pg::Failover::Config->new();
 my $parsed  = $conf->get_config('db');
+my $psql    = $conf->get_psql($parsed);
 #print Dumper $parsed;
 ok($$parsed{query}, '/\S+$/');
 
 print "# check if psql exist and in the PATH env\n";
-system "psql -V";
+system "$psql -V";
 ok($?, 0);
