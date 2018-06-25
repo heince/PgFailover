@@ -32,10 +32,11 @@ my $dbconf   = $conf->get_config('db');
 my $netconf  = $conf->get_config('network');
 my $dbport   = defined $$dbconf{dbport} ? $$dbconf{dbport} : 5432;
 my $psql     = $conf->get_psql($conf);
+my $connect_timeout = $$dbconf{connect_timeout};
 
 while (1)
 {
-    my $query = `$psql "connect_timeout=1 dbname=$$dbconf{dbname}" -U $$dbconf{dbuser} -h $$netconf{vip} -p $dbport -c "$$dbconf{query}"`;
+    my $query = `$psql "connect_timeout=$connect_timeout dbname=$$dbconf{dbname}" -U $$dbconf{dbuser} -h $$netconf{vip} -p $dbport -c "$$dbconf{query}"`;
     if ($? == 0)
     {
         print "ok\n";
